@@ -14,11 +14,26 @@ but check your terminal — the port may differ).
 
 import gradio as gr
 
-from agent import run_agent
+from agent import run_agent, setup_tool_logging
+
+setup_tool_logging()
 from utils.data_loader import get_example_wardrobe, get_empty_wardrobe
 
 
 # ── query handler ─────────────────────────────────────────────────────────────
+
+def _format_listing(item: dict) -> str:
+    """Format a listing dict for the top-listing output panel."""
+    tags = ", ".join(item.get("style_tags", []))
+    brand = item.get("brand") or "unbranded"
+    return (
+        f"{item['title']}\n"
+        f"${item['price']:.2f} on {item['platform']} · {item['condition']} condition\n"
+        f"Size: {item['size']} · {brand}\n"
+        f"Style: {tags}\n\n"
+        f"{item['description']}"
+    )
+
 
 def handle_query(user_query: str, wardrobe_choice: str) -> tuple[str, str, str]:
     """
@@ -43,8 +58,38 @@ def handle_query(user_query: str, wardrobe_choice: str) -> tuple[str, str, str]:
            string and return it along with session["outfit_suggestion"] and
            session["fit_card"].
     """
-    # TODO: implement this function
-    return "Agent not yet implemented.", "", ""
+    if not user_query or not user_query.strip():
+        return "Please enter a search query.", "", ""
+
+    wardrobe = (
+        get_example_wardrobe()
+        if wardrobe_choice == "Example wardrobe"
+        else get_empty_wardrobe()
+    )
+
+    session = run_agent(user_query.strip(), wardrobe)
+
+    # Search failed — nothing to show in other panels
+    if session["error"] and not session["selected_item"]:
+        return session["error"], "", ""
+
+    listing_text = _format_listing(session["selected_item"])
+    outfit = session["outfit_suggestion"] or ""
+    fit_card = session["fit_card"] or ""
+
+    # Partial failure after search (outfit or fit card tool failed)
+    if session["error"]:
+        if outfit and not fit_card:
+            fit_card = session["error"]
+        else:
+            outfit = session["error"]
+
+    if wardrobe_choice == "Empty wardrobe (new user)" and outfit and not session["error"]:
+        outfit = (
+            "(General styling advice — no wardrobe items on file)\n\n" + outfit
+        )
+
+    return listing_text, outfit, fit_card
 
 
 # ── interface ─────────────────────────────────────────────────────────────────
