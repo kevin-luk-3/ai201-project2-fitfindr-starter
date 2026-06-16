@@ -18,7 +18,25 @@ Usage (once implemented):
     print(result["error"])   # None on success
 """
 
+import logging
+import re
+
 from tools import search_listings, suggest_outfit, create_fit_card
+
+TOOL_LOGGER = logging.getLogger("fitfindr.tools")
+
+
+def setup_tool_logging() -> None:
+    """Enable terminal output for the three FitFindr tool calls only."""
+    if TOOL_LOGGER.handlers:
+        return
+    handler = logging.StreamHandler()
+    handler.setFormatter(
+        logging.Formatter("%(asctime)s %(message)s", datefmt="%H:%M:%S")
+    )
+    TOOL_LOGGER.addHandler(handler)
+    TOOL_LOGGER.setLevel(logging.INFO)
+    TOOL_LOGGER.propagate = False
 
 
 # ── session state ─────────────────────────────────────────────────────────────
@@ -41,8 +59,93 @@ def _new_session(query: str, wardrobe: dict) -> dict:
         "wardrobe": wardrobe,        # user's wardrobe dict
         "outfit_suggestion": None,   # string returned by suggest_outfit
         "fit_card": None,            # string returned by create_fit_card
+        "search_adjustment": None,   # note when retry loosened filters
         "error": None,               # set if the interaction ended early
     }
+
+
+# ── query parsing ─────────────────────────────────────────────────────────────
+
+def _parse_query(query: str) -> dict:
+    """Extract description, size, and max_price from a natural language query."""
+    text = query.strip()
+    max_price = None
+    size = None
+
+    price_match = re.search(
+        r"(?:under|below|max|less than)\s*\$?(\d+(?:\.\d+)?)",
+        text,
+        re.IGNORECASE,
+    )
+    if price_match:
+        max_price = float(price_match.group(1))
+        text = (text[: price_match.start()] + text[price_match.end() :]).strip()
+
+    size_match = re.search(r"size[:\s]+([A-Za-z0-9/]+)", text, re.IGNORECASE)
+    if size_match:
+        size = size_match.group(1)
+        text = (text[: size_match.start()] + text[size_match.end() :]).strip()
+
+    text = re.sub(r"[,;]+$", "", text).strip()
+    text = re.sub(
+        r"^(?:looking for|i(?:'m| am) looking for|find(?: me)?)\s+",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    ).strip()
+    description = text if text else query.strip()
+
+    return {"description": description, "size": size, "max_price": max_price}
+
+
+def _no_results_message(parsed: dict) -> str:
+    desc = parsed.get("description", "your search")
+    msg = f"No listings found for '{desc}'"
+    if parsed.get("max_price") is not None:
+        msg += f" under ${parsed['max_price']:.0f}"
+    if parsed.get("size"):
+        msg += f" in size {parsed['size']}"
+    return (
+        msg + ". Try a broader search term, a higher budget, or drop the size filter."
+    )
+
+
+def _search_with_retry(parsed: dict) -> tuple[list, str | None]:
+    """Search listings, retrying with loosened constraints if the first pass is empty."""
+    description = parsed["description"]
+    size = parsed.get("size")
+    max_price = parsed.get("max_price")
+
+    results = search_listings(description, size, max_price)
+    if results:
+        return results, None
+
+    if size is not None:
+        TOOL_LOGGER.info(
+            "search_listings retry: dropped size filter (was %r)", size
+        )
+        results = search_listings(description, None, max_price)
+        if results:
+            return results, (
+                f"No exact matches in size {size} — retried without the size filter."
+            )
+
+    if max_price is not None:
+        TOOL_LOGGER.info(
+            "search_listings retry: dropped size and price filters (price was %r)",
+            max_price,
+        )
+        results = search_listings(description, None, None)
+        if results:
+            removed = []
+            if size is not None:
+                removed.append(f"size {size} filter")
+            removed.append(f"${max_price:.0f} price limit")
+            return results, (
+                f"No exact matches — retried with {' and '.join(removed)} removed."
+            )
+
+    return [], None
 
 
 # ── planning loop ─────────────────────────────────────────────────────────────
@@ -92,15 +195,59 @@ def run_agent(query: str, wardrobe: dict) -> dict:
     Before writing code, complete the Planning Loop and State Management sections
     of planning.md — your implementation should match what you described there.
     """
-    # TODO: implement the planning loop
     session = _new_session(query, wardrobe)
-    session["error"] = "Planning loop not yet implemented."
+
+    parsed = _parse_query(query)
+    session["parsed"] = parsed
+
+    TOOL_LOGGER.info(
+        "search_listings(description=%r, size=%r, max_price=%r)",
+        parsed["description"],
+        parsed.get("size"),
+        parsed.get("max_price"),
+    )
+    session["search_results"], session["search_adjustment"] = _search_with_retry(parsed)
+
+    if not session["search_results"]:
+        session["error"] = _no_results_message(parsed)
+        return session
+
+    session["selected_item"] = session["search_results"][0]
+
+    wardrobe_count = len(session["wardrobe"].get("items", []))
+    TOOL_LOGGER.info(
+        "suggest_outfit(item=%r, wardrobe_items=%d)",
+        session["selected_item"]["title"],
+        wardrobe_count,
+    )
+    session["outfit_suggestion"] = suggest_outfit(
+        session["selected_item"], session["wardrobe"]
+    )
+    if session["outfit_suggestion"].startswith("Couldn't generate outfit suggestions"):
+        session["error"] = session["outfit_suggestion"]
+        return session
+
+    TOOL_LOGGER.info(
+        "create_fit_card(item=%r)",
+        session["selected_item"]["title"],
+    )
+    session["fit_card"] = create_fit_card(
+        session["outfit_suggestion"], session["selected_item"]
+    )
+    if session["fit_card"].startswith("Can't create a fit card") or session[
+        "fit_card"
+    ].startswith("Fit card generation failed"):
+        session["error"] = session["fit_card"]
+        session["fit_card"] = None
+        return session
+
     return session
 
 
 # ── CLI test ──────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    setup_tool_logging()
     from utils.data_loader import get_example_wardrobe, get_empty_wardrobe
 
     print("=== Happy path: graphic tee ===\n")
