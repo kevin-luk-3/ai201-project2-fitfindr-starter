@@ -74,6 +74,8 @@ def handle_query(user_query: str, wardrobe_choice: str) -> tuple[str, str, str]:
         return session["error"], "", ""
 
     listing_text = _format_listing(session["selected_item"])
+    if session.get("search_adjustment"):
+        listing_text = session["search_adjustment"] + "\n\n" + listing_text
     outfit = session["outfit_suggestion"] or ""
     fit_card = session["fit_card"] or ""
 
@@ -99,6 +101,7 @@ EXAMPLE_QUERIES = [
     "90s track jacket in size M",
     "flowy midi skirt under $40",
     "black combat boots size 8",
+    "vintage graphic tee size XXS under $50",  # triggers size-filter retry
     "designer ballgown size XXS under $5",   # deliberate no-results test
 ]
 

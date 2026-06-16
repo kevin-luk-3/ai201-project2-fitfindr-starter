@@ -59,6 +59,7 @@ def _new_session(query: str, wardrobe: dict) -> dict:
         "wardrobe": wardrobe,        # user's wardrobe dict
         "outfit_suggestion": None,   # string returned by suggest_outfit
         "fit_card": None,            # string returned by create_fit_card
+        "search_adjustment": None,   # note when retry loosened filters
         "error": None,               # set if the interaction ended early
     }
 
@@ -107,6 +108,44 @@ def _no_results_message(parsed: dict) -> str:
     return (
         msg + ". Try a broader search term, a higher budget, or drop the size filter."
     )
+
+
+def _search_with_retry(parsed: dict) -> tuple[list, str | None]:
+    """Search listings, retrying with loosened constraints if the first pass is empty."""
+    description = parsed["description"]
+    size = parsed.get("size")
+    max_price = parsed.get("max_price")
+
+    results = search_listings(description, size, max_price)
+    if results:
+        return results, None
+
+    if size is not None:
+        TOOL_LOGGER.info(
+            "search_listings retry: dropped size filter (was %r)", size
+        )
+        results = search_listings(description, None, max_price)
+        if results:
+            return results, (
+                f"No exact matches in size {size} — retried without the size filter."
+            )
+
+    if max_price is not None:
+        TOOL_LOGGER.info(
+            "search_listings retry: dropped size and price filters (price was %r)",
+            max_price,
+        )
+        results = search_listings(description, None, None)
+        if results:
+            removed = []
+            if size is not None:
+                removed.append(f"size {size} filter")
+            removed.append(f"${max_price:.0f} price limit")
+            return results, (
+                f"No exact matches — retried with {' and '.join(removed)} removed."
+            )
+
+    return [], None
 
 
 # ── planning loop ─────────────────────────────────────────────────────────────
@@ -167,11 +206,7 @@ def run_agent(query: str, wardrobe: dict) -> dict:
         parsed.get("size"),
         parsed.get("max_price"),
     )
-    session["search_results"] = search_listings(
-        parsed["description"],
-        parsed.get("size"),
-        parsed.get("max_price"),
-    )
+    session["search_results"], session["search_adjustment"] = _search_with_retry(parsed)
 
     if not session["search_results"]:
         session["error"] = _no_results_message(parsed)

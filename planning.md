@@ -69,7 +69,25 @@ If `outfit` is missing or empty, the tool returns an error message string (e.g.,
 
 ### Additional Tools (if any)
 
-<!-- Copy the block above for any tools beyond the required three -->
+None — retry logic is implemented in the planning loop, not as a separate tool.
+
+---
+
+## Stretch Feature: Retry Logic with Fallback
+
+**What it does:**
+If the initial `search_listings` call returns no results, the agent automatically retries with loosened constraints before giving up.
+
+**Retry order:**
+1. Original search with all parsed filters (`description`, `size`, `max_price`).
+2. If empty and `size` was set → retry with `size=None`, same `max_price`.
+3. If still empty and `max_price` was set → retry with `size=None`, `max_price=None`.
+
+**User notification:**
+If a retry succeeds, store a note in `session["search_adjustment"]` (e.g., *"No exact matches in size XXS — retried without the size filter."*). `handle_query()` prepends this to the listing panel so the user knows what changed.
+
+**If all retries fail:**
+Same error path as before — set `session["error"]` and return early.
 
 ---
 
@@ -84,7 +102,8 @@ If `outfit` is missing or empty, the tool returns an error message string (e.g.,
 2. **Parse query:** Extract `description`, `size`, and `max_price` from the natural language query using regex (e.g., `under $30` → `max_price=30.0`, `size M` → `size="M"`). Store in `session["parsed"]`. If no description can be extracted, default description to the full query string.
 
 3. **Search branch:** Call `search_listings(parsed["description"], parsed.get("size"), parsed.get("max_price"))`. Store result in `session["search_results"]`.
-   - **If `search_results` is empty:** Set `session["error"]` with actionable advice, return session immediately. Do **not** call `suggest_outfit` or `create_fit_card`.
+   - **If `search_results` is empty:** Retry with loosened constraints (stretch feature): drop size filter first, then drop price limit. Store any adjustment note in `session["search_adjustment"]` so the UI can tell the user what changed.
+   - **If still empty after retries:** Set `session["error"]` with actionable advice, return session immediately. Do **not** call `suggest_outfit` or `create_fit_card`.
    - **If results exist:** Set `session["selected_item"] = search_results[0]` (top match by relevance).
 
 4. **Suggest branch:** Call `suggest_outfit(session["selected_item"], session["wardrobe"])`. Store in `session["outfit_suggestion"]`. Always proceed — empty wardrobe is handled inside the tool, not by skipping this step.
@@ -112,6 +131,7 @@ All state lives in a single `session` dict returned by `run_agent()`. No re-prom
 | `wardrobe` | Session init (from caller) | Passed to `suggest_outfit` |
 | `outfit_suggestion` | After `suggest_outfit` | Passed to `create_fit_card` |
 | `fit_card` | After `create_fit_card` | Final user-facing output |
+| `search_adjustment` | After a successful retry with loosened filters | Shown in listing panel so user knows what changed |
 | `error` | On early exit or tool failure | Checked first in UI; other outputs may be `None` |
 
 The same `selected_item` dict object flows from search → suggest → fit card without the user re-entering it. `app.py`'s `handle_query()` reads the session dict and maps fields to the three Gradio output panels.
@@ -124,8 +144,9 @@ For each tool, describe the specific failure mode you're handling and what the a
 
 | Tool | Failure mode | Agent response |
 |------|-------------|----------------|
-| search_listings | No results match the query | Set `session["error"]` to: *"No listings found for '[description]' under $[max_price] in size [size]. Try a broader search term, a higher budget, or drop the size filter."* Return session early with `fit_card=None`. Tell the user in the UI error panel — do not call downstream tools. |
+| search_listings | No results match the query (even after retry — see Stretch Feature) | Set `session["error"]` to: *"No listings found for '[description]' under $[max_price] in size [size]. Try a broader search term, a higher budget, or drop the size filter."* Return session early with `fit_card=None`. Tell the user in the UI error panel — do not call downstream tools. |
 | suggest_outfit | Wardrobe is empty | Tool returns general styling advice (not an error). Agent proceeds normally and notes in the outfit panel that suggestions are general since no wardrobe items were provided. |
+| suggest_outfit | LLM call fails or returns empty text | Tool returns fallback: *"Couldn't generate outfit suggestions right now. Try again, or style this as a [category] piece with neutral basics."* Agent sets `session["error"]` to that message and returns early — does not call `create_fit_card`. |
 | create_fit_card | Outfit input is missing or incomplete | Tool returns error string. Agent sets `session["error"]` to that message, keeps `outfit_suggestion` visible, and shows the user: *"Couldn't generate a fit card — here's your outfit suggestion instead."* |
 
 ---
